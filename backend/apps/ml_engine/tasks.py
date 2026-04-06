@@ -11,48 +11,56 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 
+def _upsert_ohlcv_frame(df_raw: pd.DataFrame, tick: str) -> int:
+    from apps.market_data.models import OHLCVBar
+
+    records = []
+    for ts, row in df_raw.iterrows():
+        records.append(OHLCVBar(
+            ticker=tick,
+            timestamp=ts.date(),
+            open=float(row["open"]),
+            high=float(row["high"]),
+            low=float(row["low"]),
+            close=float(row["close"]),
+            adj_close=float(row["adj_close"]),
+            volume=int(row["volume"]),
+        ))
+
+    if not records:
+        return 0
+
+    OHLCVBar.objects.bulk_create(
+        records,
+        update_conflicts=True,
+        update_fields=["open", "high", "low", "close", "adj_close", "volume"],
+        unique_fields=["ticker", "timestamp"],
+    )
+    return len(records)
+
+
+def _fetch_and_store_range(fetcher, tick: str, start, end) -> int:
+    padded_start = (pd.Timestamp(start) - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+    padded_end = (pd.Timestamp(end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    df = fetcher.get_ohlcv(tick, padded_start, padded_end)
+    return _upsert_ohlcv_frame(df, tick)
+
+
 @shared_task(bind=True, queue="data_fetch", name="fetch_market_data")
 def fetch_market_data(self, ticker: str, benchmark: str,
                       start: str, end: str) -> dict:
     """Download OHLCV and upsert into TimescaleDB."""
-    from apps.market_data.models import OHLCVBar
     from apps.ml_engine.pipeline.data_fetcher import DataFetcher
     from django.conf import settings
 
     log.info(f"Fetching {ticker} | {start} → {end}")
 
-    def _upsert(df_raw, tick):
-        records = []
-        for ts, row in df_raw.iterrows():
-            records.append(OHLCVBar(
-                ticker=tick, timestamp=ts.date(),
-                open=float(row["Open"]), high=float(row["High"]),
-                low=float(row["Low"]), close=float(row["Close"]),
-                adj_close=float(row["Adj Close"] if "Adj Close" in row else row["Close"]), volume=int(row["Volume"]),
-            ))
-        OHLCVBar.objects.bulk_create(
-            records, update_conflicts=True,
-            update_fields=["open","high","low","close","adj_close","volume"],
-            unique_fields=["ticker","timestamp"],
-        )
-        return len(records)
-
     fetcher = DataFetcher(
         cache_dir=Path(settings.BASE_DIR) / "data" / "cache",
         ttl_hours=24,
     )
-    stock_df = fetcher.get_ohlcv(ticker, start, end)
-    bench_df = fetcher.get_ohlcv(benchmark, start, end)
-    stock_df = stock_df.rename(columns={
-        "open": "Open", "high": "High", "low": "Low",
-        "close": "Close", "adj_close": "Adj Close", "volume": "Volume",
-    })
-    bench_df = bench_df.rename(columns={
-        "open": "Open", "high": "High", "low": "Low",
-        "close": "Close", "adj_close": "Adj Close", "volume": "Volume",
-    })
-    n1 = _upsert(stock_df, ticker)
-    n2 = _upsert(bench_df, benchmark)
+    n1 = _fetch_and_store_range(fetcher, ticker, start, end)
+    n2 = _fetch_and_store_range(fetcher, benchmark, start, end)
     return {"stock_rows": n1, "bench_rows": n2}
 
 
@@ -73,6 +81,7 @@ def run_training(self, run_id: str) -> dict:
     from apps.ml_engine.pipeline.trainer import get_trainer
     from apps.ml_engine.pipeline.data_fetcher import DataFetcher
     from apps.market_data.models import OHLCVBar
+    from django.db.models import Min, Max
     from django.conf import settings
     from django.utils import timezone
 
@@ -92,43 +101,17 @@ def run_training(self, run_id: str) -> dict:
             cache_dir=Path(settings.BASE_DIR) / "data" / "cache",
             ttl_hours=24,
         )
-        stock_cache = None
-        bench_cache = None
-        try:
-            stock_cache = fetcher.get_ohlcv(exp.ticker, str(exp.date_start), str(exp.date_end))
-            bench_cache = fetcher.get_ohlcv(exp.benchmark, str(exp.date_start), str(exp.date_end))
-        except Exception as fetch_err:
-            log.warning(
-                "Market fetch failed for run %s: %s. Fallback to existing DB rows.",
-                run_id,
-                fetch_err,
-            )
-
-        def _upsert_df(df_raw: pd.DataFrame, tick: str):
-            records = []
-            for ts, row in df_raw.iterrows():
-                records.append(OHLCVBar(
-                    ticker=tick,
-                    timestamp=ts.date(),
-                    open=float(row["open"]),
-                    high=float(row["high"]),
-                    low=float(row["low"]),
-                    close=float(row["close"]),
-                    adj_close=float(row["adj_close"]),
-                    volume=int(row["volume"]),
-                ))
-            if records:
-                OHLCVBar.objects.bulk_create(
-                    records,
-                    update_conflicts=True,
-                    update_fields=["open", "high", "low", "close", "adj_close", "volume"],
-                    unique_fields=["ticker", "timestamp"],
+        for tick in (exp.ticker, exp.benchmark):
+            try:
+                inserted = _fetch_and_store_range(fetcher, tick, exp.date_start, exp.date_end)
+                log.info("Synced %s rows for %s before training run %s", inserted, tick, run_id)
+            except Exception as fetch_err:
+                log.warning(
+                    "Market fetch failed for run %s ticker %s: %s. Fallback to existing DB rows.",
+                    run_id,
+                    tick,
+                    fetch_err,
                 )
-
-        if stock_cache is not None:
-            _upsert_df(stock_cache, exp.ticker)
-        if bench_cache is not None:
-            _upsert_df(bench_cache, exp.benchmark)
 
         def _load(tick, start, end):
             qs = OHLCVBar.objects.filter(
@@ -136,7 +119,21 @@ def run_training(self, run_id: str) -> dict:
             ).order_by("timestamp").values("timestamp","open","high","low","adj_close","volume")
             rows = list(qs)
             if not rows:
-                raise ValueError(f"No OHLCV rows for {tick} in selected range.")
+                agg = OHLCVBar.objects.filter(ticker=tick).aggregate(
+                    first_date=Min("timestamp"),
+                    last_date=Max("timestamp"),
+                )
+                first_date = agg["first_date"]
+                last_date = agg["last_date"]
+                if first_date and last_date:
+                    raise ValueError(
+                        f"No OHLCV rows for {tick} in selected range {start}~{end}. "
+                        f"Available DB range is {first_date}~{last_date}."
+                    )
+                raise ValueError(
+                    f"No OHLCV rows for {tick} in selected range {start}~{end}. "
+                    "Fetch also failed, so TimescaleDB currently has no cached rows for this ticker."
+                )
             df = pd.DataFrame(rows).set_index("timestamp")
             df.index = pd.to_datetime(df.index)
             return df.ffill().dropna()
