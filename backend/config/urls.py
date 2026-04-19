@@ -12,6 +12,7 @@ from apps.ml_engine.views import (
     TrainingRunStatusView, BacktestResultView, PredictionView, HealthCheckView,
     LiveDeploymentListCreateView, LiveDeploymentDetailView, LaunchLiveRunView,
     LiveRunStatusView, LivePredictionView, LiveFeedbackView, RetrainExperimentView,
+    RunSourceDataExportView,
 )
 from apps.backtest.views import WalkForwardView, MonteCarloView, ComparisonView
 
@@ -34,6 +35,7 @@ urlpatterns = [
     path("api/experiments/<uuid:exp_id>/compare/", ComparisonView.as_view()),
     path("api/runs/<uuid:run_id>/status/",        TrainingRunStatusView.as_view()),
     path("api/runs/<uuid:run_id>/backtest/",      BacktestResultView.as_view()),
+    path("api/runs/<uuid:run_id>/source-data/",   RunSourceDataExportView.as_view()),
     path("api/runs/<uuid:run_id>/prediction/",    PredictionView.as_view()),
     path("api/live-deployments/", LiveDeploymentListCreateView.as_view()),
     path("api/live-deployments/<uuid:deployment_id>/", LiveDeploymentDetailView.as_view()),

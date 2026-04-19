@@ -1,7 +1,10 @@
+import csv
+import re
 from datetime import datetime, timedelta, time as dt_time
 
 from django.db import connections, transaction
 from django.db.models import Q
+from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import filters, permissions, status, viewsets
 from rest_framework.response import Response
@@ -101,6 +104,11 @@ def _parse_time_string(value):
 
 def _table_exists(table_name: str, using: str = "default") -> bool:
     return table_name in connections[using].introspection.table_names()
+
+
+def _safe_export_component(value: str, fallback: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or fallback)).strip("-._")
+    return cleaned or fallback
 
 
 def _delete_experiment_records(exp) -> None:
@@ -448,6 +456,97 @@ class BacktestResultView(APIView):
             "drawdown_curve": bt.drawdown_curve,
             "position_log": bt.position_log,
         })
+
+
+class RunSourceDataExportView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, run_id):
+        from apps.market_data.models import OHLCVBar
+        from apps.ml_engine.models import TrainingRun
+
+        run = TrainingRun.objects.select_related("experiment").get(
+            id=run_id,
+            experiment__user=request.user,
+        )
+        exp = run.experiment
+        raw_fields = ("timestamp", "open", "high", "low", "close", "adj_close", "volume")
+
+        stock_rows = {
+            row["timestamp"]: row
+            for row in OHLCVBar.objects.filter(
+                ticker=exp.ticker,
+                timestamp__gte=exp.date_start,
+                timestamp__lte=exp.date_end,
+            ).order_by("timestamp").values(*raw_fields)
+        }
+        benchmark_rows = {
+            row["timestamp"]: row
+            for row in OHLCVBar.objects.filter(
+                ticker=exp.benchmark,
+                timestamp__gte=exp.date_start,
+                timestamp__lte=exp.date_end,
+            ).order_by("timestamp").values(*raw_fields)
+        }
+
+        # The training pipeline aligns stock and benchmark on their shared dates.
+        aligned_dates = sorted(set(stock_rows).intersection(benchmark_rows))
+        if not aligned_dates:
+            return Response({"error": "No aligned source data found for this run."}, status=404)
+
+        stock_name = _safe_export_component(exp.ticker, "stock")
+        benchmark_name = _safe_export_component(exp.benchmark, "benchmark")
+        filename = (
+            f"source_data_{stock_name}_vs_{benchmark_name}_"
+            f"{exp.date_start}_{exp.date_end}_{str(run.id)[:8]}.csv"
+        )
+
+        response = HttpResponse(content_type="text/csv; charset=utf-8")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        response["Access-Control-Expose-Headers"] = "Content-Disposition"
+        response.write("\ufeff")
+
+        writer = csv.writer(response)
+        writer.writerow([
+            "date",
+            "stock_ticker",
+            "stock_open",
+            "stock_high",
+            "stock_low",
+            "stock_close",
+            "stock_adj_close",
+            "stock_volume",
+            "benchmark_ticker",
+            "benchmark_open",
+            "benchmark_high",
+            "benchmark_low",
+            "benchmark_close",
+            "benchmark_adj_close",
+            "benchmark_volume",
+        ])
+
+        for current_date in aligned_dates:
+            stock = stock_rows[current_date]
+            benchmark = benchmark_rows[current_date]
+            writer.writerow([
+                current_date.isoformat(),
+                exp.ticker,
+                stock["open"],
+                stock["high"],
+                stock["low"],
+                stock["close"],
+                stock["adj_close"],
+                stock["volume"],
+                exp.benchmark,
+                benchmark["open"],
+                benchmark["high"],
+                benchmark["low"],
+                benchmark["close"],
+                benchmark["adj_close"],
+                benchmark["volume"],
+            ])
+
+        return response
 
 
 class PredictionView(APIView):

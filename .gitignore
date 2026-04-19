@@ -20,7 +20,7 @@ instance/
 
 # Django migrations (if you want to ignore auto-generated migrations)
 # Uncomment below if migrating from local only, not in version control
-# **/migrations/*.py
+ **/migrations/*.py
 !**/migrations/__init__.py
 
 # Celery

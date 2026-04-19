@@ -1,5 +1,7 @@
+import { useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
+import toast from "react-hot-toast";
 import { api } from "../api/client";
 import {
   ComposedChart, AreaChart, Area, Line, Bar, XAxis, YAxis, CartesianGrid,
@@ -22,14 +24,58 @@ const T = ({active,payload,label})=>active&&payload?.length?(
 
 const pct = (v,d=2)=> v==null?"—":`${(v*100).toFixed(d)}%`;
 const n   = (v,d=3)=> v==null?"—":v.toFixed(d);
+const fallbackSourceFilename = (id)=>`run-${id}-source-data.csv`;
+
+function getDownloadFilename(disposition, fallback) {
+  if (!disposition) return fallback;
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      return utf8Match[1];
+    }
+  }
+  const plainMatch = disposition.match(/filename="?([^"]+)"?/i);
+  return plainMatch?.[1] || fallback;
+}
 
 export default function BacktestPage() {
   const { id } = useParams();
+  const [isDownloadingSourceData, setIsDownloadingSourceData] = useState(false);
   const { data, isLoading } = useQuery({
     queryKey:["backtest",id],
     queryFn:()=>api.get(`/runs/${id}/backtest/`).then(r=>r.data),
     refetchInterval: d=>d?.metrics?false:3000,
   });
+
+  const handleDownloadSourceData = async () => {
+    if (!id || isDownloadingSourceData) return;
+    setIsDownloadingSourceData(true);
+    try {
+      const response = await api.get(`/runs/${id}/source-data/`, { responseType:"blob" });
+      const filename = getDownloadFilename(
+        response.headers["content-disposition"],
+        fallbackSourceFilename(id),
+      );
+      const blob = response.data instanceof Blob
+        ? response.data
+        : new Blob([response.data], { type:"text/csv;charset=utf-8" });
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => window.URL.revokeObjectURL(url), 0);
+      toast.success("原始資料已開始下載");
+    } catch {
+      toast.error("下載原始資料失敗");
+    } finally {
+      setIsDownloadingSourceData(false);
+    }
+  };
 
   if(isLoading) return (
     <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:300}}>
@@ -67,15 +113,34 @@ export default function BacktestPage() {
   return (
     <div style={{maxWidth:1100}}>
       {/* Header */}
-      <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:28}}>
+      <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:12,flexWrap:"wrap",marginBottom:28}}>
         <div>
           <h1 style={{fontSize:22,fontWeight:800,color:"#f1f5f9",letterSpacing:"-0.02em"}}>📊 回測報告</h1>
           <p style={{fontSize:12,color:"#475569",marginTop:4,fontFamily:"'JetBrains Mono',monospace"}}>RUN {id?.slice(0,8).toUpperCase()}</p>
         </div>
-        <Link to={`/run/${id}/prediction`}
-          style={{padding:"9px 18px",borderRadius:9,background:"linear-gradient(135deg,#7c3aed,#6366f1)",color:"#fff",fontSize:13,fontWeight:600,textDecoration:"none"}}>
-          🔮 查看明日預測 →
-        </Link>
+        <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+          <button
+            type="button"
+            onClick={handleDownloadSourceData}
+            disabled={isDownloadingSourceData}
+            style={{
+              padding:"9px 18px",
+              borderRadius:9,
+              border:"1px solid rgba(148,163,184,0.16)",
+              background:"rgba(15,23,42,0.78)",
+              color:"#e2e8f0",
+              fontSize:13,
+              fontWeight:600,
+              cursor:isDownloadingSourceData?"wait":"pointer",
+              opacity:isDownloadingSourceData?0.72:1,
+            }}>
+            {isDownloadingSourceData ? "匯出中..." : "下載原始資料 CSV"}
+          </button>
+          <Link to={`/run/${id}/prediction`}
+            style={{padding:"9px 18px",borderRadius:9,background:"linear-gradient(135deg,#7c3aed,#6366f1)",color:"#fff",fontSize:13,fontWeight:600,textDecoration:"none"}}>
+            🔮 查看明日預測 →
+          </Link>
+        </div>
       </div>
 
       {/* Metrics */}
